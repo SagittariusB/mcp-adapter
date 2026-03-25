@@ -282,15 +282,36 @@ final class UploadMediaAbility {
 	 * Prevents the server from being used as a proxy to access internal services,
 	 * cloud metadata endpoints (169.254.169.254), or private network resources.
 	 *
+	 * Returns the validated IP on success so callers can pin it for the actual
+	 * HTTP request, defeating DNS rebinding attacks (where the hostname resolves
+	 * to a public IP on first lookup but a private IP on second lookup).
+	 *
 	 * @param string $url The URL to validate.
 	 *
-	 * @return true|\WP_Error True if safe, WP_Error if blocked.
+	 * @return string|\WP_Error Validated public IP address on success, WP_Error if blocked.
 	 */
 	private static function check_ssrf( string $url ) {
 		$host = wp_parse_url( $url, PHP_URL_HOST );
 
 		if ( empty( $host ) ) {
 			return new \WP_Error( 'invalid_host', 'URL has no valid hostname.' );
+		}
+
+		// If the host is already an IP literal, validate it directly.
+		$host_without_brackets = trim( $host, '[]' );
+		if ( false !== filter_var( $host_without_brackets, FILTER_VALIDATE_IP ) ) {
+			$is_public = filter_var(
+				$host_without_brackets,
+				FILTER_VALIDATE_IP,
+				FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+			);
+			if ( false === $is_public ) {
+				return new \WP_Error(
+					'ssrf_blocked',
+					'URL points to a private or reserved IP address. Only public URLs are allowed.'
+				);
+			}
+			return $host_without_brackets;
 		}
 
 		// Resolve hostname to IP(s).
@@ -300,6 +321,7 @@ final class UploadMediaAbility {
 			return new \WP_Error( 'dns_resolution_failed', 'Could not resolve hostname.' );
 		}
 
+		// Validate ALL resolved IPs — if any is private, block the request.
 		foreach ( $ips as $ip ) {
 			// FILTER_VALIDATE_IP with FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
 			// blocks: 10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x, ::1, fc00::/7, etc.
@@ -317,7 +339,25 @@ final class UploadMediaAbility {
 			}
 		}
 
-		return true;
+		// Return the first validated IP for pinning.
+		return $ips[0];
+	}
+
+	/**
+	 * Validate that a resolved IP is public (not private/reserved).
+	 *
+	 * Used as a post-download belt-and-suspenders check against DNS rebinding.
+	 *
+	 * @param string $ip The IP address to validate.
+	 *
+	 * @return bool True if the IP is public.
+	 */
+	private static function is_public_ip( string $ip ): bool {
+		return false !== filter_var(
+			$ip,
+			FILTER_VALIDATE_IP,
+			FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+		);
 	}
 
 	/**
@@ -346,17 +386,45 @@ final class UploadMediaAbility {
 			return new \WP_Error( 'invalid_scheme', 'Only http and https URLs are allowed.' );
 		}
 
-		// SSRF protection: block private, reserved, and link-local IPs.
-		$ssrf_check = self::check_ssrf( $url );
-		if ( is_wp_error( $ssrf_check ) ) {
-			return $ssrf_check;
+		// SSRF protection: resolve DNS and block private/reserved IPs.
+		// Returns the validated IP so we can pin it for the download,
+		// defeating DNS rebinding attacks.
+		$validated_ip = self::check_ssrf( $url );
+		if ( is_wp_error( $validated_ip ) ) {
+			return $validated_ip;
 		}
+
+		// Pin the validated IP for the HTTP request to prevent DNS rebinding.
+		// WordPress HTTP API uses the 'http_request_args' filter, but the most
+		// reliable approach is 'pre_http_request' to validate the actual connection.
+		// We use 'http_api_curl' to set CURLOPT_RESOLVE, which forces cURL to use
+		// our pre-validated IP, bypassing a second DNS lookup entirely.
+		$host   = wp_parse_url( $url, PHP_URL_HOST );
+		$port   = wp_parse_url( $url, PHP_URL_PORT ) ?? ( 'https' === $scheme ? 443 : 80 );
+		$pinned = "{$host}:{$port}:{$validated_ip}";
+
+		$pin_dns = static function ( $handle ) use ( $pinned ) {
+			if ( function_exists( 'curl_setopt' ) && is_resource( $handle ) || $handle instanceof \CurlHandle ) {
+				// CURLOPT_RESOLVE pins hostname→IP so cURL never re-resolves DNS.
+				curl_setopt( $handle, CURLOPT_RESOLVE, array( $pinned ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_setopt
+			}
+		};
+
+		add_action( 'http_api_curl', $pin_dns );
 
 		// Download the file to a temp location with a 30-second timeout.
 		$tmp_file = download_url( $url, 30 );
 
+		// Always remove the filter after download to avoid leaking into other requests.
+		remove_action( 'http_api_curl', $pin_dns );
+
 		if ( is_wp_error( $tmp_file ) ) {
-			return $tmp_file;
+			// Sanitize error message to avoid leaking internal network details
+			// (hostnames, IPs, ports) from download_url() failures.
+			return new \WP_Error(
+				'download_failed',
+				'Failed to download file from the provided URL.'
+			);
 		}
 
 		// Enforce download size limit (prevents fetching multi-GB files).

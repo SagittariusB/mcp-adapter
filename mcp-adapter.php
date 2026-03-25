@@ -55,3 +55,20 @@ if ( ! Autoloader::autoload() ) {
 if ( class_exists( Plugin::class ) ) {
 	Plugin::instance();
 }
+
+// Register deactivation hook to clean up upload-related resources.
+register_deactivation_hook(
+	__FILE__,
+	static function () {
+		// Unschedule the temp file cleanup cron job.
+		$timestamp = wp_next_scheduled( 'mcp_adapter_cleanup_temp_uploads' );
+		if ( $timestamp ) {
+			wp_unschedule_event( $timestamp, 'mcp_adapter_cleanup_temp_uploads' );
+		}
+
+		// Clean up all remaining temp files.
+		if ( class_exists( Upload\TempFileManager::class ) ) {
+			Upload\TempFileManager::cleanup_expired();
+		}
+	}
+);

@@ -355,6 +355,25 @@ final class UploadMediaAbilityTest extends TestCase {
 		}
 	}
 
+	public function test_download_failure_does_not_leak_internal_details(): void {
+		// A URL that will fail to download. The error message should be generic,
+		// not exposing internal hostnames, IPs, or network topology.
+		$result = UploadMediaAbility::execute(
+			array( 'url' => 'https://example.com/nonexistent-image.jpg' )
+		);
+
+		if ( ! $result['success'] ) {
+			// Should not contain IP addresses or internal hostnames.
+			$this->assertDoesNotMatchRegularExpression(
+				'/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/',
+				$result['error'],
+				'Error message should not contain IP addresses'
+			);
+			$this->assertStringNotContainsString( 'resolve', strtolower( $result['error'] ) );
+			$this->assertStringNotContainsString( 'curl', strtolower( $result['error'] ) );
+		}
+	}
+
 	// ---------------------------------------------------------------
 	// TempFileManager — UUID validation
 	// ---------------------------------------------------------------
