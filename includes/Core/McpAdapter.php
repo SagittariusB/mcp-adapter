@@ -12,6 +12,8 @@ namespace WP\MCP\Core;
 use WP\MCP\Abilities\DiscoverAbilitiesAbility;
 use WP\MCP\Abilities\ExecuteAbilityAbility;
 use WP\MCP\Abilities\GetAbilityInfoAbility;
+use WP\MCP\Abilities\UploadMediaAbility;
+use WP\MCP\Upload\UploadEndpoint;
 use WP\MCP\Cli\McpCommand;
 use WP\MCP\Infrastructure\ErrorHandling\Contracts\McpErrorHandlerInterface;
 use WP\MCP\Infrastructure\ErrorHandling\NullMcpErrorHandler;
@@ -343,9 +345,13 @@ final class McpAdapter {
 	 * @return void
 	 */
 	public function register_default_abilities(): void {
-		// Register the three core MCP abilities
+		// Register the core MCP abilities
 		DiscoverAbilitiesAbility::register();
 		GetAbilityInfoAbility::register();
 		ExecuteAbilityAbility::register();
+		UploadMediaAbility::register();
+
+		// Register the upload staging endpoint (multipart file uploads).
+		UploadEndpoint::register();
 	}
 }

@@ -54,6 +54,7 @@ class DefaultServerFactory {
 				'mcp-adapter/discover-abilities',
 				'mcp-adapter/get-ability-info',
 				'mcp-adapter/execute-ability',
+				'mcp-adapter/upload-media',
 			),
 			'resources'              => $auto_discovered_resources,
 			'prompts'                => $auto_discovered_prompts,
