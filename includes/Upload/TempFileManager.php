@@ -84,6 +84,10 @@ class TempFileManager {
 			return false;
 		}
 
+		// Restrict file permissions (owner read/write only — not executable, not world-readable).
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_chmod
+		chmod( $dest_path, 0600 );
+
 		$metadata = array(
 			'temp_id'       => $temp_id,
 			'filename'      => $filename,
@@ -110,6 +114,11 @@ class TempFileManager {
 	 * @return array|false File metadata array or false if not found/expired.
 	 */
 	public static function get( string $temp_id ) {
+		// Validate temp_id is a UUID v4 format to prevent transient key injection.
+		if ( ! preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $temp_id ) ) {
+			return false;
+		}
+
 		$metadata = get_transient( self::TRANSIENT_PREFIX . $temp_id );
 
 		if ( false === $metadata ) {
@@ -119,6 +128,41 @@ class TempFileManager {
 		// Verify the file still exists on disk.
 		if ( ! file_exists( $metadata['path'] ) ) {
 			delete_transient( self::TRANSIENT_PREFIX . $temp_id );
+			return false;
+		}
+
+		return $metadata;
+	}
+
+	/**
+	 * Atomically claim a staged file (retrieve + delete transient).
+	 *
+	 * This prevents race conditions where two concurrent requests both
+	 * pass the permission check and try to finalize the same temp file.
+	 * The first caller gets the metadata; the second gets false.
+	 *
+	 * @param string $temp_id The temporary file ID.
+	 *
+	 * @return array|false File metadata array or false if not found/already claimed.
+	 */
+	public static function claim( string $temp_id ) {
+		// Validate temp_id is a UUID v4 format.
+		if ( ! preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $temp_id ) ) {
+			return false;
+		}
+
+		$transient_key = self::TRANSIENT_PREFIX . $temp_id;
+		$metadata      = get_transient( $transient_key );
+
+		if ( false === $metadata ) {
+			return false;
+		}
+
+		// Immediately delete the transient so no other request can claim it.
+		delete_transient( $transient_key );
+
+		// Verify the file still exists on disk.
+		if ( ! file_exists( $metadata['path'] ) ) {
 			return false;
 		}
 
@@ -143,6 +187,44 @@ class TempFileManager {
 		delete_transient( self::TRANSIENT_PREFIX . $temp_id );
 
 		return true;
+	}
+
+	/**
+	 * Count how many staged files a user currently has (DoS protection).
+	 *
+	 * @param int $user_id The WordPress user ID.
+	 *
+	 * @return int Number of active staged files for this user.
+	 */
+	public static function count_user_files( int $user_id ): int {
+		global $wpdb;
+
+		// Query transients that belong to this user.
+		// Transient values are serialized arrays; we check for the uploaded_by field.
+		// This is intentionally a broad count — it's a rate limit, not a billing meter.
+		$prefix = '_transient_' . self::TRANSIENT_PREFIX;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$count = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s AND option_value LIKE %s",
+				$wpdb->esc_like( $prefix ) . '%',
+				'%"uploaded_by";i:' . $user_id . ';%'
+			)
+		);
+
+		return (int) $count;
+	}
+
+	/**
+	 * Schedule the cleanup cron job.
+	 */
+	public static function schedule_cleanup(): void {
+		if ( ! wp_next_scheduled( 'mcp_adapter_cleanup_temp_uploads' ) ) {
+			wp_schedule_event( time(), 'hourly', 'mcp_adapter_cleanup_temp_uploads' );
+		}
+
+		add_action( 'mcp_adapter_cleanup_temp_uploads', array( self::class, 'cleanup_expired' ) );
 	}
 
 	/**

@@ -13,6 +13,7 @@ use WP\MCP\Abilities\DiscoverAbilitiesAbility;
 use WP\MCP\Abilities\ExecuteAbilityAbility;
 use WP\MCP\Abilities\GetAbilityInfoAbility;
 use WP\MCP\Abilities\UploadMediaAbility;
+use WP\MCP\Upload\TempFileManager;
 use WP\MCP\Upload\UploadEndpoint;
 use WP\MCP\Cli\McpCommand;
 use WP\MCP\Infrastructure\ErrorHandling\Contracts\McpErrorHandlerInterface;
@@ -353,5 +354,8 @@ final class McpAdapter {
 
 		// Register the upload staging endpoint (multipart file uploads).
 		UploadEndpoint::register();
+
+		// Schedule cleanup of expired temp files.
+		TempFileManager::schedule_cleanup();
 	}
 }

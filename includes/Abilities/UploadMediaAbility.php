@@ -229,10 +229,12 @@ final class UploadMediaAbility {
 	 * @return int|\WP_Error Attachment ID on success, WP_Error on failure.
 	 */
 	private static function upload_from_temp( string $temp_id, int $post_id = 0 ) {
-		$metadata = TempFileManager::get( $temp_id );
+		// Atomic claim: retrieve and immediately delete the transient to prevent
+		// race conditions where concurrent requests both pass the permission check.
+		$metadata = TempFileManager::claim( $temp_id );
 
 		if ( false === $metadata ) {
-			return new \WP_Error( 'temp_file_not_found', 'Staged file not found or expired.' );
+			return new \WP_Error( 'temp_file_not_found', 'Staged file not found, expired, or already claimed.' );
 		}
 
 		// Prepare file array for media_handle_sideload.
@@ -245,13 +247,60 @@ final class UploadMediaAbility {
 			'size'     => $metadata['size'],
 		);
 
-		// media_handle_sideload will move the file, so we don't need to clean up manually.
+		// media_handle_sideload will move the file into the uploads directory.
 		$attachment_id = media_handle_sideload( $file_array, $post_id );
 
-		// Clean up the transient regardless of success.
-		TempFileManager::cleanup( $temp_id );
+		// If sideload failed and the file still exists, clean it up.
+		if ( is_wp_error( $attachment_id ) && file_exists( $metadata['path'] ) ) {
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.unlink_unlink
+			unlink( $metadata['path'] );
+		}
 
 		return $attachment_id;
+	}
+
+	/**
+	 * SSRF protection: resolve hostname and block private/reserved IP ranges.
+	 *
+	 * Prevents the server from being used as a proxy to access internal services,
+	 * cloud metadata endpoints (169.254.169.254), or private network resources.
+	 *
+	 * @param string $url The URL to validate.
+	 *
+	 * @return true|\WP_Error True if safe, WP_Error if blocked.
+	 */
+	private static function check_ssrf( string $url ) {
+		$host = wp_parse_url( $url, PHP_URL_HOST );
+
+		if ( empty( $host ) ) {
+			return new \WP_Error( 'invalid_host', 'URL has no valid hostname.' );
+		}
+
+		// Resolve hostname to IP(s).
+		$ips = gethostbynamel( $host );
+
+		if ( false === $ips || empty( $ips ) ) {
+			return new \WP_Error( 'dns_resolution_failed', 'Could not resolve hostname.' );
+		}
+
+		foreach ( $ips as $ip ) {
+			// FILTER_VALIDATE_IP with FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+			// blocks: 10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x, ::1, fc00::/7, etc.
+			$is_public = filter_var(
+				$ip,
+				FILTER_VALIDATE_IP,
+				FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+			);
+
+			if ( false === $is_public ) {
+				return new \WP_Error(
+					'ssrf_blocked',
+					'URL resolves to a private or reserved IP address. Only public URLs are allowed.'
+				);
+			}
+		}
+
+		return true;
 	}
 
 	/**
@@ -272,6 +321,12 @@ final class UploadMediaAbility {
 		$scheme = wp_parse_url( $url, PHP_URL_SCHEME );
 		if ( ! in_array( $scheme, array( 'http', 'https' ), true ) ) {
 			return new \WP_Error( 'invalid_scheme', 'Only http and https URLs are allowed.' );
+		}
+
+		// SSRF protection: block private, reserved, and link-local IPs.
+		$ssrf_check = self::check_ssrf( $url );
+		if ( is_wp_error( $ssrf_check ) ) {
+			return $ssrf_check;
 		}
 
 		// Download the file to a temp location.

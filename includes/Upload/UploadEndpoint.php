@@ -27,13 +27,16 @@ class UploadEndpoint {
 
 	/**
 	 * Allowed MIME types for upload.
+	 *
+	 * Note: SVG is excluded by default due to stored XSS risk (SVGs can contain JavaScript).
+	 * Add 'image/svg+xml' via the mcp_adapter_upload_allowed_types filter if your site
+	 * has SVG sanitization in place.
 	 */
 	private const ALLOWED_MIME_TYPES = array(
 		'image/jpeg',
 		'image/png',
 		'image/gif',
 		'image/webp',
-		'image/svg+xml',
 		'image/bmp',
 		'image/tiff',
 		'video/mp4',
@@ -44,6 +47,11 @@ class UploadEndpoint {
 		'audio/ogg',
 		'audio/wav',
 	);
+
+	/**
+	 * Maximum number of staged files per user (DoS protection).
+	 */
+	private const MAX_STAGED_FILES_PER_USER = 10;
 
 	/**
 	 * Register the REST API routes.
@@ -139,22 +147,69 @@ class UploadEndpoint {
 			);
 		}
 
-		// Validate MIME type.
+		// Validate MIME type using both extension and file content inspection.
 		$allowed_types = apply_filters( 'mcp_adapter_upload_allowed_types', self::ALLOWED_MIME_TYPES );
 
-		// Use wp_check_filetype for server-side MIME detection.
-		$filetype = wp_check_filetype( $file['name'] );
-		$mime     = $filetype['type'] ?? $file['type'];
+		// wp_check_filetype_and_ext reads actual file bytes (not just extension).
+		$validated = wp_check_filetype_and_ext( $file['tmp_name'], $file['name'] );
+		$mime      = $validated['type'] ?? false;
 
-		if ( ! in_array( $mime, $allowed_types, true ) ) {
+		// Fallback to extension-based check if content sniffing returned false
+		// (some server configs disable fileinfo).
+		if ( ! $mime ) {
+			$filetype = wp_check_filetype( $file['name'] );
+			$mime     = $filetype['type'] ?? false;
+		}
+
+		if ( ! $mime || ! in_array( $mime, $allowed_types, true ) ) {
 			return new \WP_Error(
 				'invalid_file_type',
 				sprintf(
 					/* translators: %s: the MIME type that was rejected */
 					__( 'File type "%s" is not allowed.', 'mcp-adapter' ),
-					esc_html( $mime )
+					esc_html( $mime ?: 'unknown' )
 				),
 				array( 'status' => 415 )
+			);
+		}
+
+		// Block dangerous extensions that could execute server-side, regardless of MIME.
+		$extension = strtolower( pathinfo( $file['name'], PATHINFO_EXTENSION ) );
+		$dangerous = array( 'php', 'phtml', 'php3', 'php4', 'php5', 'php7', 'phps', 'pht', 'phar', 'shtml', 'cgi', 'pl', 'py', 'asp', 'aspx', 'jsp' );
+		if ( in_array( $extension, $dangerous, true ) ) {
+			return new \WP_Error(
+				'dangerous_file_type',
+				__( 'This file type is not allowed for security reasons.', 'mcp-adapter' ),
+				array( 'status' => 415 )
+			);
+		}
+
+		// Also check for double extensions (e.g., evil.php.jpg).
+		$all_extensions = explode( '.', strtolower( $file['name'] ) );
+		array_shift( $all_extensions ); // Remove the base name.
+		foreach ( $all_extensions as $ext ) {
+			if ( in_array( $ext, $dangerous, true ) ) {
+				return new \WP_Error(
+					'dangerous_file_type',
+					__( 'This file type is not allowed for security reasons.', 'mcp-adapter' ),
+					array( 'status' => 415 )
+				);
+			}
+		}
+
+		// Per-user staging limit (DoS protection).
+		$max_staged = apply_filters( 'mcp_adapter_upload_max_staged_per_user', self::MAX_STAGED_FILES_PER_USER );
+		$user_id    = get_current_user_id();
+		$staged     = TempFileManager::count_user_files( $user_id );
+		if ( $staged >= $max_staged ) {
+			return new \WP_Error(
+				'too_many_staged',
+				sprintf(
+					/* translators: %d: maximum number of staged files */
+					__( 'You have too many staged files (%d). Finalize or wait for existing uploads to expire.', 'mcp-adapter' ),
+					$max_staged
+				),
+				array( 'status' => 429 )
 			);
 		}
 
