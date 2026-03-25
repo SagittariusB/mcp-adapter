@@ -157,6 +157,23 @@ final class UploadMediaAbility {
 
 		$post_id = ! empty( $input['post_id'] ) ? (int) $input['post_id'] : 0;
 
+		// Verify the user can edit the target post before attaching media to it.
+		if ( $post_id > 0 ) {
+			$post = get_post( $post_id );
+			if ( ! $post ) {
+				return array(
+					'success' => false,
+					'error'   => 'The specified post_id does not exist.',
+				);
+			}
+			if ( ! current_user_can( 'edit_post', $post_id ) ) {
+				return array(
+					'success' => false,
+					'error'   => 'You do not have permission to attach media to this post.',
+				);
+			}
+		}
+
 		if ( ! empty( $temp_id ) ) {
 			$result = self::upload_from_temp( $temp_id, $post_id );
 		} else {
@@ -304,6 +321,12 @@ final class UploadMediaAbility {
 	}
 
 	/**
+	 * Maximum download size for URL-based uploads in bytes (20 MB).
+	 * Matches the staging endpoint's default limit.
+	 */
+	private const MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024;
+
+	/**
 	 * Download a file from a URL and upload to the media library.
 	 *
 	 * @param string $url     The URL to download from.
@@ -329,11 +352,24 @@ final class UploadMediaAbility {
 			return $ssrf_check;
 		}
 
-		// Download the file to a temp location.
-		$tmp_file = download_url( $url );
+		// Download the file to a temp location with a 30-second timeout.
+		$tmp_file = download_url( $url, 30 );
 
 		if ( is_wp_error( $tmp_file ) ) {
 			return $tmp_file;
+		}
+
+		// Enforce download size limit (prevents fetching multi-GB files).
+		$max_size = apply_filters( 'mcp_adapter_upload_max_size', self::MAX_DOWNLOAD_SIZE );
+		// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		$file_size = @filesize( $tmp_file );
+		if ( $file_size && $file_size > $max_size ) {
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.unlink_unlink
+			unlink( $tmp_file );
+			return new \WP_Error(
+				'file_too_large',
+				sprintf( 'Downloaded file exceeds maximum allowed size of %s.', size_format( $max_size ) )
+			);
 		}
 
 		// Extract filename from URL.
