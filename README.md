@@ -70,7 +70,13 @@ For detailed information about MCP components, see the [Model Context Protocol s
 ├── Abilities/
 │   ├── DiscoverAbilitiesAbility.php # Ability discovery
 │   ├── ExecuteAbilityAbility.php    # Ability execution
-│   └── GetAbilityInfoAbility.php    # Ability introspection
+│   ├── GetAbilityInfoAbility.php    # Ability introspection
+│   └── UploadMediaAbility.php       # Media upload (temp_id or URL)
+│
+│   # Two-step media upload (avoids base64 over JSON-RPC)
+├── Upload/
+│   ├── UploadEndpoint.php           # REST endpoint for multipart staging
+│   └── TempFileManager.php          # Temp file storage, cleanup, DoS limits
 │
 │   # CLI and STDIO transport support
 ├── Cli/
@@ -474,6 +480,85 @@ The [`@automattic/mcp-wordpress-remote`](https://www.npmjs.com/package/@automatt
 ```
 
 </details>
+
+## Media Upload
+
+The MCP Adapter includes a two-step media upload flow that avoids sending binary data through JSON-RPC. This solves the common problem of image/file uploads failing or being impractical over MCP's JSON-based protocol.
+
+### How It Works
+
+**Step 1 — Stage the file** via standard multipart HTTP POST:
+
+```bash
+curl -X POST https://yoursite.com/wp-json/mcp-adapter/v1/upload \
+  -H "Authorization: Basic <app-password>" \
+  -F "file=@photo.jpg"
+
+# Response: { "temp_id": "a1b2c3d4-...", "filename": "photo.jpg", "size": 245000, "expires_in": 3600 }
+```
+
+**Step 2 — Finalize via MCP tool** (lightweight JSON, no binary):
+
+```
+tools/call → mcp-adapter-upload-media
+  { "temp_id": "a1b2c3d4-...", "title": "My Photo", "alt_text": "A sunset over the ocean" }
+
+# Response: { "success": true, "attachment_id": 456, "url": "https://yoursite.com/wp-content/uploads/2026/03/photo.jpg" }
+```
+
+**Or upload directly from a URL** (no staging needed):
+
+```
+tools/call → mcp-adapter-upload-media
+  { "url": "https://example.com/image.jpg", "title": "Downloaded Image" }
+```
+
+### Upload Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `temp_id` | string | One of temp_id/url | Temp ID from the staging endpoint |
+| `url` | string | One of temp_id/url | Public URL to download from |
+| `title` | string | No | Attachment title |
+| `alt_text` | string | No | Image alt text |
+| `caption` | string | No | Attachment caption |
+| `post_id` | integer | No | Post ID to attach the media to |
+
+### Configuration Filters
+
+| Filter | Default | Description |
+|--------|---------|-------------|
+| `mcp_adapter_upload_max_size` | 20 MB | Maximum file size in bytes |
+| `mcp_adapter_upload_allowed_types` | Common image/video/audio/PDF types | Array of allowed MIME types |
+| `mcp_adapter_upload_max_staged_per_user` | 10 | Max concurrent staged files per user |
+
+### Security
+
+The upload system includes multiple layers of protection:
+
+- **Authentication**: Requires WordPress `upload_files` capability
+- **MIME validation**: Content-based file type detection (not just extension)
+- **Extension blocklist**: Blocks PHP, PHTML, CGI, and other executable extensions (including double extensions like `evil.php.jpg`)
+- **SSRF protection**: URL mode resolves hostnames and blocks private/reserved IP ranges (169.254.x, 10.x, 127.x, etc.)
+- **Ownership enforcement**: Only the user who staged a file can finalize it
+- **Race condition prevention**: Atomic claim mechanism prevents double-finalization
+- **Temp file DoS protection**: Per-user staging limit + hourly WP-Cron cleanup
+- **File permissions**: Staged files are stored with `0600` permissions
+- **SVG excluded by default**: SVGs can contain JavaScript; add via filter only if your site has SVG sanitization
+
+### Server Configuration (Important for Nginx)
+
+Staged files are stored in `wp-content/uploads/mcp-temp-uploads/`. Apache is protected via `.htaccess`, but **Nginx requires manual configuration**:
+
+```nginx
+# Block direct access to staged upload files
+location ~* /wp-content/uploads/mcp-temp-uploads/ {
+    deny all;
+    return 403;
+}
+```
+
+Add this block to your Nginx server configuration and reload (`nginx -s reload`).
 
 ## Advanced Usage
 
